@@ -211,3 +211,42 @@ def store_chunks():
         "stored_chunks": len(documents),
         "collection_total": collection.count()
     }
+
+
+@app.post("/search")
+def search_chunks(request: QuestionRequest):
+    # Convert the user's question into the same 384-number format.
+    question_embedding = embedding_model.encode(
+    request.question
+    ).tolist()
+
+    # Find the three stored chunks closest to the question.
+    results = collection.query(
+        query_embeddings=[question_embedding],
+        n_results=3,
+        include=["documents", "metadatas", "distances"]
+    )
+
+    # Create a beginner-friendly response instead of returning raw results.
+    matches = []
+
+    # ChromaDB returns one result list for each submitted question.
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    # Combine each retrieved document with its metadata and distance.
+    for document, metadata, distance in zip(
+        documents, metadatas, distances
+    ):
+        matches.append({
+            "text": document,
+            "source": metadata["source"],
+            "chunk_index": metadata["chunk_index"],
+            "distance": distance
+        })
+
+    return {
+        "question": request.question,
+        "matches": matches
+    }
