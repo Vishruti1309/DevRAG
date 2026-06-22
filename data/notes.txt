@@ -1,0 +1,2 @@
+DevRAG is a developer assistant that answers questions using project files.
+It can read notes, documentation, and code.
