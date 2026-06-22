@@ -3,7 +3,7 @@ import chromadb
 from fastapi import FastAPI  # FastAPI framework to build APIs
 from pydantic import BaseModel  # Used to define request body structure
 from sentence_transformers import SentenceTransformer
-
+import requests
 
 app = FastAPI()
 
@@ -157,48 +157,47 @@ def embedding_test():
     }   
 
 
-@app.post("/store-chunks")
-def store_chunks():
-    # These lists will hold the data ChromaDB needs.
+@app.post("/ingest")
+def ingest_files():
+    # Find records stored during an earlier ingestion.
+    existing_records = collection.get()
+    existing_ids = existing_records["ids"]
+
+    # Clear old records so ChromaDB matches the current data folder.
+    if existing_ids:
+        collection.delete(ids=existing_ids)
+
+    # Prepare the four lists needed by ChromaDB.
     ids = []
     documents = []
     metadatas = []
 
-    # Visit every item inside the data folder.
+    # Read every supported file from the data folder.
     for file_path in DATA_DIR.iterdir():
-        # Process only supported files.
         if file_path.is_file() and file_path.suffix in SUPPORTED_EXTENSIONS:
-            # Read the complete file.
             content = file_path.read_text(encoding="utf-8")
-
-            # Split the file into smaller pieces.
             chunks = chunk_text(content)
 
-            # Prepare every chunk for storage.
+            # Give every chunk an ID and source information.
             for index, chunk in enumerate(chunks):
-                # Create a repeatable unique ID, such as notes.txt:0.
-                chunk_id = f"{file_path.name}:{index}"
-
-                ids.append(chunk_id)
+                ids.append(f"{file_path.name}:{index}")
                 documents.append(chunk)
-
-                # Metadata remembers where this chunk came from.
                 metadatas.append({
                     "source": file_path.name,
                     "chunk_index": index
                 })
 
-    # Avoid calling the embedding model when no files were found.
+    # Return early if the data folder has no supported files.
     if not documents:
         return {
             "message": "No supported files found",
             "stored_chunks": 0
         }
 
-    # Convert all chunks into 384-number vectors in one batch.
+    # Generate embeddings locally for all chunks together.
     embeddings = embedding_model.encode(documents).tolist()
 
-    # Add new records or update existing records in ChromaDB.
+    # Store text, metadata, IDs, and embeddings in ChromaDB.
     collection.upsert(
         ids=ids,
         documents=documents,
@@ -207,7 +206,10 @@ def store_chunks():
     )
 
     return {
-        "message": "Chunks stored successfully",
+        "message": "Ingestion completed",
+        "files_processed": len({
+            metadata["source"] for metadata in metadatas
+        }),
         "stored_chunks": len(documents),
         "collection_total": collection.count()
     }
@@ -249,4 +251,77 @@ def search_chunks(request: QuestionRequest):
     return {
         "question": request.question,
         "matches": matches
+    }
+
+
+@app.post("/query")
+def answer_question(request: QuestionRequest):
+    # Convert the question into a local embedding.
+    question_embedding = embedding_model.encode(
+        request.question
+    ).tolist()
+
+    # Retrieve the three most relevant chunks from ChromaDB.
+    results = collection.query(
+        query_embeddings=[question_embedding],
+        n_results=3,
+        include=["documents", "metadatas"]
+    )
+
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+
+    # Add source names to the context given to the local LLM.
+    context_parts = []
+
+    for document, metadata in zip(documents, metadatas):
+        context_parts.append(
+            f"Source: {metadata['source']}\nContent: {document}"
+        )
+
+    context = "\n\n".join(context_parts)
+
+    # Tell the model to use only retrieved project information.
+    prompt = f"""
+You are DevRAG, a developer assistant.
+
+Answer the question using only the context below.
+If the answer is not in the context, say:
+"I could not find that information in the project files."
+
+Mention the source filename used in your answer.
+
+Context:
+{context}
+
+Question:
+{request.question}
+
+Answer:
+"""
+
+    # Send the prompt to Ollama running locally on port 11434.
+    ollama_response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "qwen2.5-coder:1.5b",
+            "prompt": prompt,
+            "stream": False
+        },
+        timeout=120
+    )
+
+    # Raise an error if Ollama returned an unsuccessful response.
+    ollama_response.raise_for_status()
+
+    # Extract the generated text from Ollama's JSON response.
+    answer = ollama_response.json()["response"].strip()
+
+    # Return the answer and the source files used as context.
+    return {
+        "question": request.question,
+        "answer": answer,
+        "sources": [
+            metadata["source"] for metadata in metadatas
+        ]
     }
