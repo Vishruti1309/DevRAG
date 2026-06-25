@@ -1,6 +1,6 @@
 from pathlib import Path  # Used to handle file paths easily
 import chromadb 
-from fastapi import FastAPI  # FastAPI framework to build APIs
+from fastapi import FastAPI, HTTPException, UploadFile,File # HTTPException the API return clear error message, UploadFile allow the API to receive uploaded files.
 from pydantic import BaseModel  # Used to define request body structure
 from sentence_transformers import SentenceTransformer
 import requests
@@ -14,7 +14,9 @@ DATA_DIR = Path("../data")
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".py"}
 
 # Define chunk size should be
-CHUNK_SIZE = 100
+CHUNK_SIZE = 500
+
+MAX_FILE_SIZE = 1_000_000
 
 
 CHROMA_DIR = Path("../chroma_db")
@@ -256,40 +258,73 @@ def search_chunks(request: QuestionRequest):
 
 @app.post("/query")
 def answer_question(request: QuestionRequest):
-    # Convert the question into a local embedding.
+    # A query cannot work until files have been ingested.
+    stored_count = collection.count()
+
+    if stored_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No chunks found. Run POST /ingest first."
+        )
+
+    # Convert the question into the same embedding format as our chunks.
     question_embedding = embedding_model.encode(
         request.question
     ).tolist()
 
-    # Retrieve the three most relevant chunks from ChromaDB.
+    # Never request more results than the collection contains.
+    result_count = min(3, stored_count)
+
+    # Retrieve the closest chunks from ChromaDB.
     results = collection.query(
         query_embeddings=[question_embedding],
-        n_results=3,
-        include=["documents", "metadatas"]
+        n_results=result_count,
+        include=["documents", "metadatas", "distances"]
     )
 
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
 
-    # Add source names to the context given to the local LLM.
+    # Keep only chunks that are close enough to the question.
+    # Smaller distance means better match.
+    MAX_DISTANCE = 1.2
+
+    filtered_documents = []
+    filtered_metadatas = []
+
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        if distance <= MAX_DISTANCE:
+            filtered_documents.append(document)
+            filtered_metadatas.append(metadata)
+
+    if not filtered_documents:
+        return {
+            "question": request.question,
+            "answer": "I could not find relevant information in the uploaded project files.",
+            "sources": []
+        }
+
+
+    # Build context containing both chunk text and its source.
     context_parts = []
 
-    for document, metadata in zip(documents, metadatas):
+    for document, metadata in zip(filtered_documents, filtered_metadatas):
         context_parts.append(
             f"Source: {metadata['source']}\nContent: {document}"
         )
 
     context = "\n\n".join(context_parts)
 
-    # Tell the model to use only retrieved project information.
+    # Restrict the local model to information found in the project.
     prompt = f"""
 You are DevRAG, a developer assistant.
 
-Answer the question using only the context below.
-If the answer is not in the context, say:
+Answer using only the supplied context.
+If the answer is missing from the context, say:
 "I could not find that information in the project files."
 
-Mention the source filename used in your answer.
+Mention the source filename used in the answer.
 
 Context:
 {context}
@@ -300,28 +335,138 @@ Question:
 Answer:
 """
 
-    # Send the prompt to Ollama running locally on port 11434.
-    ollama_response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "qwen2.5-coder:1.5b",
-            "prompt": prompt,
-            "stream": False
-        },
-        timeout=120
-    )
+    try:
+        # Ask the Ollama model running on this computer.
+        ollama_response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "qwen2.5-coder:1.5b",
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=120
+        )
 
-    # Raise an error if Ollama returned an unsuccessful response.
-    ollama_response.raise_for_status()
+        # Treat unsuccessful Ollama responses as errors.
+        ollama_response.raise_for_status()
 
-    # Extract the generated text from Ollama's JSON response.
+    except requests.RequestException as error:
+        # Return a useful API error instead of a long Python traceback.
+        raise HTTPException(
+            status_code=503,
+            detail="Could not reach Ollama. Make sure Ollama is running."
+        ) from error
+
     answer = ollama_response.json()["response"].strip()
 
-    # Return the answer and the source files used as context.
+    
+# Each source tells us which file and which chunk was used.
+    sources = []
+
+    for metadata in filtered_metadatas:
+        source_info = {
+            "filename": metadata["source"],
+            "chunk_index": metadata["chunk_index"]
+        }
+
+        if source_info not in sources:
+            sources.append(source_info)
+
+
     return {
         "question": request.question,
         "answer": answer,
-        "sources": [
-            metadata["source"] for metadata in metadatas
-        ]
+        "sources": sources
+    }
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    # Ensure the uploaded file has a name.
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file must have a filename."
+        )
+
+    # Remove folder information from unsafe names such as ../../file.txt.
+    safe_filename = Path(file.filename).name
+
+    # Convert the extension to lowercase before validation.
+    extension = Path(safe_filename).suffix.lower()
+
+    # Reject unsupported file formats.
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only .txt, .md, and .py files are supported."
+        )
+
+    # Read the uploaded file into memory.
+    file_bytes = await file.read()
+
+        # Do not allow empty files.
+    if len(file_bytes) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty."
+        )
+
+    # Prevent unexpectedly large uploads.
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="File must be smaller than 1 MB."
+        )
+
+    try:
+        # Confirm that the file contains readable UTF-8 text.
+        content = file_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="File must contain valid UTF-8 text."
+        ) from error
+
+    # Save the validated file inside the data folder.
+    destination = DATA_DIR / safe_filename
+    destination.write_text(content, encoding="utf-8")
+
+    return {
+        "message": "File uploaded successfully",
+        "filename": safe_filename,
+        "size_bytes": len(file_bytes)
+    }
+
+
+@app.get("/status")
+def project_status():
+    # Count supported files inside the data folder.
+    files = []
+
+    for file_path in DATA_DIR.iterdir():
+        if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(file_path.name)
+
+    # Check how many chunks are currently stored in ChromaDB.
+    stored_chunks = collection.count()
+
+    # Check whether Ollama is running on this computer.
+    try:
+        ollama_response = requests.get(
+            "http://localhost:11434/api/tags",
+            timeout=5
+        )
+
+        ollama_running = ollama_response.status_code == 200
+
+    except requests.RequestException:
+        ollama_running = False
+
+    return {
+        "api": "running",
+        "supported_files_count": len(files),
+        "supported_files": files,
+        "stored_chunks": stored_chunks,
+        "ollama_running": ollama_running
     }

@@ -1,0 +1,61 @@
+# DevRAG Sample Notes
+
+DevRAG is a Retrieval-Augmented Generation (RAG) system designed for developers.
+
+It reads project files, converts them into embeddings, and allows users to ask questions about the codebase.
+
+---
+
+## Authentication Module
+
+The authentication logic is implemented in the file auth.py.
+
+It uses JWT (JSON Web Tokens) to manage user sessions.
+
+Steps:
+
+1. User logs in with username and password.
+2. Server verifies credentials.
+3. A JWT token is generated.
+4. Token is sent back to the user.
+
+---
+
+## greet() Function
+
+The greet() function is defined in example.py.
+
+It is a simple function that takes a name as input and returns a greeting message.
+
+Example:
+greet("Vishu") → "Hello, Vishu!"
+
+---
+
+## Database
+
+The project uses MongoDB as the database.
+
+Data is stored in collections such as:
+
+* users
+* sessions
+
+---
+
+## Frontend
+
+The frontend is built using React.
+
+It communicates with the backend using REST APIs.
+
+---
+
+## Error Handling
+
+Errors are logged in logs.txt.
+
+Common errors include:
+
+* Invalid token
+* Database connection failure
